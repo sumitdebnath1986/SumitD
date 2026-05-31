@@ -4,11 +4,8 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-import re
-import random
 from datetime import datetime, timedelta
-from anthropic import Anthropic
-import os
+import json
 
 # ------------------------------
 # 1. DATABASE SETUP (SQLite)
@@ -30,43 +27,6 @@ def init_db():
             lead_time_days INTEGER,
             unit_price REAL,
             shipping_countries TEXT
-        )
-    ''')
-
-    # Master Blanket PO #123456
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS master_po (
-            id INTEGER PRIMARY KEY,
-            po_number TEXT,
-            mpn TEXT,
-            total_qty INTEGER,
-            remaining_qty INTEGER,
-            status TEXT
-        )
-    ''')
-
-    # Branch POs (child POs)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS branch_po (
-            id INTEGER PRIMARY KEY,
-            branch_po_number TEXT,
-            master_po_number TEXT,
-            mpn TEXT,
-            ordered_qty INTEGER,
-            created_at TEXT,
-            cart_name TEXT
-        )
-    ''')
-
-    # Audit trail: branch PO entries under master PO
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS master_po_audit (
-            id INTEGER PRIMARY KEY,
-            master_po_number TEXT,
-            branch_po_number TEXT,
-            mpn TEXT,
-            qty INTEGER,
-            created_at TEXT
         )
     ''')
 
@@ -97,20 +57,6 @@ def init_db():
             INSERT INTO supplier_catalog (mpn, supplier, material_desc, available_qty, lead_time_days, unit_price, shipping_countries)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', mock_suppliers)
-
-    # Insert master PO #123456 if empty
-    cursor.execute("SELECT COUNT(*) FROM master_po")
-    if cursor.fetchone()[0] == 0:
-        master_items = [
-            ("123456", "MPN1001", 500, 500, "Open"),
-            ("123456", "MPN1002", 300, 300, "Open"),
-            ("123456", "MPN1003", 200, 200, "Open"),
-            ("123456", "MPN1004", 100, 100, "Open"),
-        ]
-        cursor.executemany('''
-            INSERT INTO master_po (po_number, mpn, total_qty, remaining_qty, status)
-            VALUES (?, ?, ?, ?, ?)
-        ''', master_items)
 
     conn.commit()
     conn.close()
@@ -148,7 +94,6 @@ def load_saved_cart_by_name(email, cart_name):
         expiry = datetime.fromisoformat(row[1])
         if datetime.now() > expiry:
             return None, "Cart expired"
-        import json
         return json.loads(row[0]), "Loaded"
     return None, "Not found"
 
@@ -157,7 +102,6 @@ def save_cart_to_db(email, cart_name, cart_data):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     expiry = (datetime.now() + timedelta(days=14)).isoformat()
-    import json
     cursor.execute('''
         INSERT OR REPLACE INTO saved_carts (user_email, cart_name, cart_data, created_at, expiry_date)
         VALUES (?, ?, ?, ?, ?)
@@ -177,61 +121,8 @@ def query_supplier_catalog(mpn_list):
     conn.close()
     return df
 
-def get_master_po_remaining(mpn):
-    """Get remaining quantity in master PO for a given MPN."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT remaining_qty FROM master_po WHERE po_number = '123456' AND mpn = ?", (mpn,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-def generate_branch_po(master_po, mpn, ordered_qty, cart_name):
-    """Create branch PO, deduct quantity, log audit. Returns branch PO number."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    # Get next branch PO number (e.g., 123456.1)
-    cursor.execute("SELECT MAX(branch_po_number) FROM branch_po WHERE master_po_number = ?", (master_po,))
-    max_branch = cursor.fetchone()[0]
-    if max_branch:
-        match = re.search(r'\.(\d+)$', max_branch)
-        next_num = int(match.group(1)) + 1 if match else 1
-    else:
-        next_num = 1
-    branch_po_number = f"{master_po}.{next_num}"
-
-    # Insert branch PO record
-    cursor.execute('''
-        INSERT INTO branch_po (branch_po_number, master_po_number, mpn, ordered_qty, created_at, cart_name)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (branch_po_number, master_po, mpn, ordered_qty, datetime.now().isoformat(), cart_name))
-
-    # Deduct from master PO
-    cursor.execute('''
-        UPDATE master_po
-        SET remaining_qty = remaining_qty - ?
-        WHERE po_number = ? AND mpn = ?
-    ''', (ordered_qty, master_po, mpn))
-
-    # Update status if zero
-    cursor.execute('''
-        UPDATE master_po SET status = 'Fulfilled'
-        WHERE po_number = ? AND mpn = ? AND remaining_qty = 0
-    ''', (master_po, mpn))
-
-    # Audit trail
-    cursor.execute('''
-        INSERT INTO master_po_audit (master_po_number, branch_po_number, mpn, qty, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (master_po, branch_po_number, mpn, ordered_qty, datetime.now().isoformat()))
-
-    conn.commit()
-    conn.close()
-    return branch_po_number
-
 # ------------------------------
-# 4. BOM PARSING (no AI)
+# 4. BOM PARSING
 # ------------------------------
 def parse_bom_from_text(text):
     """Extract MPN and quantity from plain text lines."""
@@ -273,7 +164,7 @@ def parse_bom_from_csv(file):
     return items
 
 # ------------------------------
-# 5. VENDOR PRESENTATION (no split, full availability)
+# 5. VENDOR PRESENTATION
 # ------------------------------
 def get_supplier_for_items(items):
     """For each MPN, find a supplier with sufficient stock. Return list of results."""
@@ -285,13 +176,12 @@ def get_supplier_for_items(items):
         if df.empty:
             results.append({"mpn": mpn, "error": "No supplier found for this MPN"})
             continue
-        # Filter by available_qty >= needed and in stock
+        # Filter by available_qty >= needed
         available = df[df["available_qty"] >= qty_needed]
         if available.empty:
-            # Try partial? For demo we fail; could implement split but client said no splitting.
             results.append({"mpn": mpn, "error": f"Insufficient stock: max {df['available_qty'].max()} units available"})
             continue
-        # Pick first (lowest price) for simplicity
+        # Pick first (best match)
         best = available.iloc[0]
         results.append({
             "mpn": mpn,
@@ -368,7 +258,6 @@ if st.session_state.step == "login":
 # STEP 2: CONFIRM COMPANY
 # ------------------------------
 elif st.session_state.step == "confirm_company":
-    # Show a Yes/No button
     col1, col2 = st.columns(2)
     if col1.button("Yes"):
         user = st.session_state.user
@@ -384,7 +273,6 @@ elif st.session_state.step == "confirm_company":
         st.rerun()
     if col2.button("No"):
         bot_message("Please select your company from the list or contact support.")
-        # For demo simplicity, we go back to login
         st.session_state.step = "login"
         st.rerun()
 
@@ -401,8 +289,8 @@ elif st.session_state.step == "choose_saved_or_new":
                 cart_data, msg = load_saved_cart_by_name(st.session_state.user["email"], selected)
                 if cart_data:
                     st.session_state.active_cart = cart_data
-                    bot_message(f"Loaded cart '{selected}'. You can now continue shopping or proceed to checkout.")
-                    st.session_state.step = "post_cart_load"
+                    bot_message(f"Loaded cart '{selected}'. Would you like to continue shopping or proceed to checkout?")
+                    st.session_state.step = "continue_or_checkout"
                     st.rerun()
                 else:
                     st.error(msg)
@@ -421,14 +309,12 @@ elif st.session_state.step == "choose_saved_or_new":
 elif st.session_state.step == "bom_input":
     st.subheader("Enter your requirements")
     input_type = st.radio("Choose input method:", ["Type text", "Upload CSV"])
-    bom_data = None
     if input_type == "Type text":
         text_input = st.text_area("Enter one MPN and quantity per line (e.g., MPN1001 50 or MPN1001,50)")
         if st.button("Submit text"):
             items = parse_bom_from_text(text_input)
             if items:
                 st.session_state.current_bom_items = items
-                # Show confirmation
                 confirm_msg = "I found these items:\n"
                 for it in items:
                     confirm_msg += f"- {it['mpn']}: {it['qty']} units\n"
@@ -460,11 +346,9 @@ elif st.session_state.step == "bom_input":
 elif st.session_state.step == "confirm_bom":
     col1, col2 = st.columns(2)
     if col1.button("Yes"):
-        # Query supplier catalog
         items = st.session_state.current_bom_items
         results = get_supplier_for_items(items)
         st.session_state.vendor_results = results
-        # Build presentation message
         msg = "Searching supplier catalogue...\n\n"
         for r in results:
             if "error" in r:
@@ -486,7 +370,6 @@ elif st.session_state.step == "confirm_bom":
 elif st.session_state.step == "approve_cart":
     col1, col2 = st.columns(2)
     if col1.button("Yes, approve"):
-        # Create active cart in session
         st.session_state.active_cart = {
             "items": st.session_state.vendor_results,
             "created_at": datetime.now().isoformat(),
@@ -507,16 +390,14 @@ elif st.session_state.step == "save_cart_name":
     cart_name = st.text_input("Cart name (unique, e.g., PROJ-001)")
     if st.button("Save cart"):
         if cart_name:
-            # Check duplicate for this user
             existing = [c["name"] for c in st.session_state.saved_carts_list]
             if cart_name in existing:
                 st.error("Name already exists. Please choose another.")
             else:
-                # Persist to DB
                 email = st.session_state.user["email"]
                 save_cart_to_db(email, cart_name, st.session_state.active_cart)
-                # Update saved carts list
                 st.session_state.saved_carts_list.append({"name": cart_name, "expiry": (datetime.now() + timedelta(days=14)).isoformat()})
+                st.session_state.cart_name = cart_name
                 bot_message(f"Cart saved as '{cart_name}'. It will expire in 14 days. Would you like to continue shopping or move to checkout?")
                 st.session_state.step = "continue_or_checkout"
                 st.rerun()
@@ -533,46 +414,54 @@ elif st.session_state.step == "continue_or_checkout":
         st.session_state.step = "bom_input"
         st.rerun()
     if col2.button("✅ Proceed to checkout"):
-        # Generate branch POs for each item in active cart
-        master_po = "123456"
-        branch_pos = []
-        cart_items = st.session_state.active_cart["items"]
-        cart_name = None  # we haven't stored cart_name in active_cart; retrieve from last saved name?
-        # For demo, we use a default name
-        for item in cart_items:
-            if "error" in item:
-                continue
-            mpn = item["mpn"]
-            qty = item["qty"]
-            branch_po = generate_branch_po(master_po, mpn, qty, "DemoCart")
-            branch_pos.append(branch_po)
-        if branch_pos:
-            st.success(f"Branch POs created: {', '.join(branch_pos)}")
-            bot_message(f"Branch POs generated. Redirecting you to the core system checkout page...")
-        else:
-            bot_message("No valid items to checkout.")
-        # Redirect to mock core system page and end conversation
-        st.session_state.step = "redirect_checkout"
+        bot_message(f"Redirecting you to the core system checkout with cart '{st.session_state.cart_name or 'your cart'}'...")
+        st.session_state.step = "checkout"
         st.rerun()
 
 # ------------------------------
-# STEP 9: REDIRECT TO CORE SYSTEM & END CHAT
+# STEP 9: CHECKOUT REDIRECT
 # ------------------------------
-elif st.session_state.step == "redirect_checkout":
-    st.markdown("### 🏢 Core System Checkout Page")
-    st.info("This is a mock of the core system's checkout page. Your cart has been passed successfully.")
-    # Display branch PO summary
-    conn = sqlite3.connect(DB_PATH)
-    branch_df = pd.read_sql_query("SELECT * FROM branch_po ORDER BY id DESC LIMIT 5", conn)
-    conn.close()
-    st.dataframe(branch_df)
-    st.success("Order placed! The chat bot has ended this session.")
-    st.caption("In production, you would be redirected to the real core system. Click below to start a new session.")
+elif st.session_state.step == "checkout":
+    st.markdown("### 🏢 Core System Checkout")
+    st.info("Redirecting to core system checkout page...")
+    
+    # Display cart summary
+    st.subheader("Cart Summary")
+    if st.session_state.active_cart:
+        cart_items = st.session_state.active_cart["items"]
+        total_price = 0
+        items_data = []
+        
+        for item in cart_items:
+            if "error" not in item:
+                items_data.append({
+                    "MPN": item["mpn"],
+                    "Description": item["material_desc"],
+                    "Supplier": item["supplier"],
+                    "Quantity": item["qty"],
+                    "Unit Price": f"${item['unit_price']:.2f}",
+                    "Total": f"${item['total_price']:.2f}"
+                })
+                total_price += item["total_price"]
+        
+        if items_data:
+            df_display = pd.DataFrame(items_data)
+            st.dataframe(df_display, use_container_width=True)
+            st.markdown(f"**Grand Total: ${total_price:.2f}**")
+    
+    # Redirect message
+    st.success("✅ Your cart is ready for checkout in the core system!")
+    st.markdown(f"**Cart Name:** {st.session_state.cart_name}")
+    st.markdown(f"**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Mock redirect to core system
+    core_system_url = "https://core-system.example.com/checkout"
+    st.markdown(f"[🔗 Continue to Core System Checkout]({core_system_url})")
+    
+    st.caption("In production, you would be automatically redirected to the real core system.")
+    
     if st.button("Start new session"):
-        # Clear session state except database
         for key in list(st.session_state.keys()):
-            if key != "step":
-                del st.session_state[key]
+            del st.session_state[key]
         st.session_state.step = "login"
         st.rerun()
-    # Bot does not respond further
