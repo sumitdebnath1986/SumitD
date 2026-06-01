@@ -67,12 +67,18 @@ init_db()
 # 2. MOCK USER CONTEXT
 # ------------------------------
 def get_user_context(email):
-    """Return user details from mock database."""
+    """Return user details from mock database. Case-insensitive email lookup."""
     users = {
         "alice@google.com": {"name": "Alice Chen", "company": "Google, Inc.", "entities": ["Data Center Operations", "Cloud Infrastructure"]},
         "bob@google.com": {"name": "Bob Miller", "company": "Google, Inc.", "entities": ["Global Logistics"]},
     }
-    return users.get(email)
+    # Convert input email to lowercase for case-insensitive lookup
+    email_lower = email.lower().strip()
+    user_data = users.get(email_lower)
+    if user_data:
+        # Add email to user data
+        user_data["email"] = email_lower
+    return user_data
 
 def get_saved_carts_for_user(email):
     """Retrieve saved carts from database."""
@@ -205,6 +211,8 @@ if "step" not in st.session_state:
     st.session_state.step = "login"
 if "user" not in st.session_state:
     st.session_state.user = None
+if "user_email" not in st.session_state:
+    st.session_state.user_email = None
 if "saved_carts_list" not in st.session_state:
     st.session_state.saved_carts_list = []
 if "active_cart" not in st.session_state:
@@ -242,17 +250,17 @@ if st.session_state.step == "login":
         user = get_user_context(email)
         if user:
             st.session_state.user = user
+            st.session_state.user_email = user.get("email")
             # Fetch saved carts
-            saved = get_saved_carts_for_user(email)
+            saved = get_saved_carts_for_user(st.session_state.user_email)
             st.session_state.saved_carts_list = saved
             welcome = f"Hello **{user['name']}**! Welcome back. You are from **{user['company']}**, authorised for: {', '.join(user['entities'])}. Is that correct?"
             bot_message(welcome)
             st.session_state.step = "confirm_company"
             st.rerun()
         else:
-            st.error("User not found. A ticket has been raised for onboarding.")
-            bot_message("I couldn't find your account. A support ticket has been created. Please try again later.")
-            st.stop()
+            st.error("User not found. Please use alice@google.com or bob@google.com")
+            bot_message("I couldn't find your account. Please try again with one of the demo emails.")
 
 # ------------------------------
 # STEP 2: CONFIRM COMPANY
@@ -286,7 +294,7 @@ elif st.session_state.step == "choose_saved_or_new":
             cart_names = [c["name"] for c in st.session_state.saved_carts_list]
             selected = st.selectbox("Select a saved cart", cart_names)
             if st.button("Load this cart"):
-                cart_data, msg = load_saved_cart_by_name(st.session_state.user["email"], selected)
+                cart_data, msg = load_saved_cart_by_name(st.session_state.user_email, selected)
                 if cart_data:
                     st.session_state.active_cart = cart_data
                     bot_message(f"Loaded cart '{selected}'. Would you like to continue shopping or proceed to checkout?")
@@ -394,8 +402,7 @@ elif st.session_state.step == "save_cart_name":
             if cart_name in existing:
                 st.error("Name already exists. Please choose another.")
             else:
-                email = st.session_state.user["email"]
-                save_cart_to_db(email, cart_name, st.session_state.active_cart)
+                save_cart_to_db(st.session_state.user_email, cart_name, st.session_state.active_cart)
                 st.session_state.saved_carts_list.append({"name": cart_name, "expiry": (datetime.now() + timedelta(days=14)).isoformat()})
                 st.session_state.cart_name = cart_name
                 bot_message(f"Cart saved as '{cart_name}'. It will expire in 14 days. Would you like to continue shopping or move to checkout?")
