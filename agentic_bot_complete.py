@@ -104,14 +104,35 @@ def load_saved_cart_by_name(email, cart_name):
     return None, "Not found"
 
 def save_cart_to_db(email, cart_name, cart_data):
-    """Persist a saved cart with 14-day expiry."""
+    """Persist a saved cart with 14-day expiry. Convert Pandas objects to native Python types."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     expiry = (datetime.now() + timedelta(days=14)).isoformat()
+    
+    # Convert cart data to JSON-serializable format (handle Pandas Series)
+    clean_items = []
+    for item in cart_data.get("items", []):
+        if "error" not in item:
+            clean_items.append({
+                "mpn": str(item.get("mpn", "")),
+                "supplier": str(item.get("supplier", "")),
+                "material_desc": str(item.get("material_desc", "")),
+                "qty": int(item.get("qty", 0)),
+                "unit_price": float(item.get("unit_price", 0)),
+                "lead_time": int(item.get("lead_time", 0)),
+                "total_price": float(item.get("total_price", 0))
+            })
+    
+    clean_cart_data = {
+        "items": clean_items,
+        "created_at": cart_data.get("created_at", datetime.now().isoformat()),
+        "approved": cart_data.get("approved", True)
+    }
+    
     cursor.execute('''
         INSERT OR REPLACE INTO saved_carts (user_email, cart_name, cart_data, created_at, expiry_date)
         VALUES (?, ?, ?, ?, ?)
-    ''', (email, cart_name, json.dumps(cart_data), datetime.now().isoformat(), expiry))
+    ''', (email, cart_name, json.dumps(clean_cart_data), datetime.now().isoformat(), expiry))
     conn.commit()
     conn.close()
 
@@ -190,13 +211,13 @@ def get_supplier_for_items(items):
         # Pick first (best match)
         best = available.iloc[0]
         results.append({
-            "mpn": mpn,
-            "supplier": best["supplier"],
-            "material_desc": best["material_desc"],
-            "qty": qty_needed,
-            "unit_price": best["unit_price"],
-            "lead_time": best["lead_time_days"],
-            "total_price": qty_needed * best["unit_price"]
+            "mpn": str(best["mpn"]),
+            "supplier": str(best["supplier"]),
+            "material_desc": str(best["material_desc"]),
+            "qty": int(qty_needed),
+            "unit_price": float(best["unit_price"]),
+            "lead_time": int(best["lead_time_days"]),
+            "total_price": float(qty_needed * best["unit_price"])
         })
     return results
 
@@ -362,7 +383,7 @@ elif st.session_state.step == "confirm_bom":
             if "error" in r:
                 msg += f"❌ {r['mpn']}: {r['error']}\n"
             else:
-                msg += f"✅ **{r['mpn']}** – {r['material_desc']}\n   Vendor: {r['supplier']} | Qty: {r['qty']} | Price: ${r['unit_price']} each | Lead time: {r['lead_time']} days\n"
+                msg += f"✅ **{r['mpn']}** – {r['material_desc']}\n   Vendor: {r['supplier']} | Qty: {r['qty']} | Price: ${r['unit_price']:.2f} each | Lead time: {r['lead_time']} days\n"
         msg += "\nPlease review and approve the cart. Do you approve? (Yes/No)"
         bot_message(msg)
         st.session_state.step = "approve_cart"
